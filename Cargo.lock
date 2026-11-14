@@ -2378,6 +2378,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oddity-diskmap"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eframe",
+ "egui_extras",
+ "rayon",
+ "rfd",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3109,18 +3121,6 @@ name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
-
-[[package]]
-name = "sizemap"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "eframe",
- "egui_extras",
- "rayon",
- "rfd",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "skrifa"

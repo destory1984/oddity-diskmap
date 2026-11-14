@@ -1,4 +1,4 @@
-# SizeMap
+# oddity-diskmap
 
 폴더별로 디스크를 얼마나 쓰는지 보여 주는 Windows 프로그램이다. Rust와 egui로 만들었다.
 
@@ -32,7 +32,7 @@ MFT 방식이 7 → 10배 빠르다.
 cargo build --release
 ```
 
-결과물은 `target\release\sizemap.exe` 하나다.
+결과물은 `target\release\oddity-diskmap.exe` 하나다.
 
 ## 쓰는 법
 
@@ -44,8 +44,8 @@ cargo build --release
 명령줄로 시간만 잴 수도 있다.
 
 ```
-sizemap.exe --cli C:\          # MFT 방식 (관리자 권한 필요)
-sizemap.exe --cli C:\ --walk   # 일반 방식
+oddity-diskmap.exe --cli C:\          # MFT 방식 (관리자 권한 필요)
+oddity-diskmap.exe --cli C:\ --walk   # 일반 방식
 ```
 
 ## 셈하는 규칙

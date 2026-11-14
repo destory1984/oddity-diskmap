@@ -90,13 +90,13 @@ fn main() -> eframe::Result {
     let start_path = args.get(1).map(|s| normalize_path(s));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SizeMap")
+            .with_title("oddity-diskmap")
             .with_inner_size([1280.0, 900.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "SizeMap",
+        "oddity-diskmap",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, start_path)))),
     )
