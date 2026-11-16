@@ -4,3 +4,4 @@
 *.png
 .env
 !docs/*.png
+!assets/icons/*.png

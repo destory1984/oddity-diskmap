@@ -2,6 +2,7 @@
 
 use crate::tree::{fmt_count, fmt_filetime, fmt_size, Method, Progress, SortKey, Tree, NO_PARENT};
 use crate::treemap::{self, Item, FREE, R};
+use crate::icons::{self, Icons};
 use crate::win;
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
@@ -21,10 +22,27 @@ struct Scan {
     method: Method,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Pref {
     Auto,
     Walk,
+}
+
+const AUTHOR: &str = "destory1984";
+const REPO_URL: &str = "https://github.com/destory1984/oddity-diskmap";
+
+/// What is remembered between runs (eframe storage, %APPDATA%\oddity-diskmap\datapp.ron).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Saved {
+    pref: Pref,
+    use_alloc: bool,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Saved { pref: Pref::Auto, use_alloc: false }
+    }
 }
 
 enum Action {
@@ -55,6 +73,9 @@ pub struct App {
     free_space: Option<(u64, u64)>,
     generation: u64,
     layout_cache: Option<(u64, u32, Rect, bool, Vec<Item>)>,
+    icons: Icons,
+    show_settings: bool,
+    show_about: bool,
 }
 
 const LEVEL_COLORS: [Color32; 8] = [
@@ -107,6 +128,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, start: Option<String>) -> Self {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        let saved: Saved = cc
+            .storage
+            .and_then(|st| eframe::get_value(st, eframe::APP_KEY))
+            .unwrap_or_default();
         let drives = win::drives();
         let path = start
             .clone()
@@ -116,7 +141,7 @@ impl App {
             drives,
             path,
             admin: win::is_admin(),
-            pref: Pref::Auto,
+            pref: saved.pref,
             scan: None,
             tree: None,
             message: None,
@@ -125,11 +150,15 @@ impl App {
             selected: None,
             scroll_to: None,
             map_root: 0,
-            use_alloc: false,
+            use_alloc: saved.use_alloc,
             sort: (SortKey::Size, true),
             free_space: None,
             generation: 0,
             layout_cache: None,
+            icons: Icons::new(&cc.egui_ctx),
+            // DISKMAP_SHOW=settings / about opens that window at start (for screenshots)
+            show_settings: matches!(std::env::var("DISKMAP_SHOW").as_deref(), Ok("settings" | "about")),
+            show_about: std::env::var("DISKMAP_SHOW").as_deref() == Ok("about"),
         };
         if start.is_some() {
             app.start_scan();
@@ -251,17 +280,18 @@ impl App {
     // ---------------------------------------------------------------- toolbar
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
+        use icons::{tool_button, Glyph};
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             let scanning = self.scan.is_some();
             for d in self.drives.clone() {
-                let label = format!("{} {}", &d.root[..2], d.fs);
-                let r = ui
-                    .add_enabled(!scanning, egui::Button::new(label))
-                    .on_hover_text(format!(
-                        "사용 가능 {} / 전체 {}",
-                        fmt_size(d.free),
-                        fmt_size(d.total)
-                    ));
+                let r = tool_button(ui, Glyph::Drive, &d.root[..2], !scanning, false).on_hover_text(format!(
+                    "{} 훑기 ({})\n사용 가능 {} / 전체 {}",
+                    &d.root[..2],
+                    d.fs,
+                    fmt_size(d.free),
+                    fmt_size(d.total)
+                ));
                 if r.clicked() {
                     self.path = d.root.clone();
                     self.start_scan();
@@ -269,42 +299,54 @@ impl App {
             }
             ui.separator();
             let edit = ui.add_sized(
-                [320.0, 22.0],
-                egui::TextEdit::singleline(&mut self.path).hint_text("훑을 경로"),
+                [300.0, 26.0],
+                egui::TextEdit::singleline(&mut self.path)
+                    .hint_text("훑을 경로")
+                    .align(Align2::LEFT_CENTER),
             );
             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !scanning {
                 self.start_scan();
             }
-            if ui.add_enabled(!scanning, egui::Button::new("폴더 선택…")).clicked() {
+            if tool_button(ui, Glyph::Tex(&self.icons.folder), "폴더", !scanning, false)
+                .on_hover_text("훑을 폴더 고르기")
+                .clicked()
+            {
                 if let Some(p) = rfd::FileDialog::new().set_directory(&self.path).pick_folder() {
                     self.path = p.to_string_lossy().into_owned();
                     self.start_scan();
                 }
             }
             if scanning {
-                if ui.button("■ 중지").clicked() {
+                if tool_button(ui, Glyph::Stop, "중지", true, false).on_hover_text("훑기 멈추기").clicked() {
                     if let Some(s) = &self.scan {
                         s.progress.cancel.store(true, Relaxed);
                     }
                 }
-            } else if ui.button("▶ 훑기").clicked() {
+            } else if tool_button(ui, Glyph::Tex(&self.icons.scan), "훑기", true, false)
+                .on_hover_text("경로 칸의 폴더를 훑기 (Enter)")
+                .clicked()
+            {
                 self.start_scan();
             }
             ui.separator();
-            ui.label("보기:");
-            ui.selectable_value(&mut self.use_alloc, false, "크기");
-            ui.selectable_value(&mut self.use_alloc, true, "할당됨");
-            ui.separator();
-            ui.label("방식:");
-            ui.selectable_value(&mut self.pref, Pref::Auto, "MFT (빠름)")
-                .on_hover_text("관리자 권한 + NTFS일 때 MFT를 직접 읽습니다. 안 되면 일반 방식으로 돌아갑니다.");
-            ui.selectable_value(&mut self.pref, Pref::Walk, "일반");
+            if tool_button(ui, Glyph::Size, "크기", true, !self.use_alloc)
+                .on_hover_text("파일 크기로 보기")
+                .clicked()
+            {
+                self.use_alloc = false;
+            }
+            if tool_button(ui, Glyph::Alloc, "할당됨", true, self.use_alloc)
+                .on_hover_text("디스크에 실제로 잡힌 공간으로 보기")
+                .clicked()
+            {
+                self.use_alloc = true;
+            }
             ui.separator();
             if self.admin {
-                ui.colored_label(Color32::from_rgb(120, 200, 120), "관리자");
-            } else if ui
-                .button("관리자로 다시 시작")
-                .on_hover_text("MFT 고속 읽기는 관리자 권한이 필요합니다")
+                tool_button(ui, Glyph::Shield, "관리자", false, false)
+                    .on_hover_text("관리자 권한으로 실행 중. MFT 고속 읽기를 쓸 수 있습니다");
+            } else if tool_button(ui, Glyph::Shield, "관리자로", true, false)
+                .on_hover_text("관리자로 다시 시작. MFT 고속 읽기는 관리자 권한이 필요합니다")
                 .clicked()
             {
                 let arg = format!("\"{}\"", crate::normalize_path(&self.path));
@@ -312,7 +354,124 @@ impl App {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if tool_button(ui, Glyph::Tex(&self.icons.settings), "설정", true, self.show_settings)
+                    .on_hover_text("설정, 프로그램 정보")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
+                }
+            });
         });
+    }
+
+    // ---------------------------------------------------------------- settings
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        use egui::text::{LayoutJob, TextFormat};
+        if !self.show_settings {
+            return;
+        }
+        let muted = Color32::from_gray(150);
+        let mut title = LayoutJob::default();
+        title.append(
+            "설정",
+            0.0,
+            TextFormat { font_id: FontId::proportional(17.0), color: Color32::from_gray(230), valign: Align::BOTTOM, ..Default::default() },
+        );
+        title.append(
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            6.0,
+            TextFormat { font_id: FontId::proportional(12.0), color: muted, valign: Align::BOTTOM, ..Default::default() },
+        );
+        let mut open = true;
+        let shown = egui::Window::new(title)
+            .id(egui::Id::unique("settings_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                egui::Frame::group(ui.style()).inner_margin(12).show(ui, |ui| {
+                    ui.set_width(354.0);
+                    ui.label(egui::RichText::new("훑는 방식").size(15.0).strong());
+                    ui.separator();
+                    ui.radio_value(&mut self.pref, Pref::Auto, "MFT 방식 (빠름)");
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "NTFS의 파일 목록 표(MFT)를 직접 읽습니다. 파일 250만 개 C드라이브에서 2.6 → 3.7초였습니다. \
+                         관리자 권한과 NTFS가 필요하고, 안 되면 일반 방식으로 돌아갑니다.",
+                    ).size(12.0).color(muted)).wrap());
+                    ui.radio_value(&mut self.pref, Pref::Walk, "일반 방식");
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "폴더를 하나씩 엽니다. 같은 드라이브에서 24 → 27초였습니다. 권한 없는 폴더는 건너뜁니다.",
+                    ).size(12.0).color(muted)).wrap());
+                    ui.add_space(2.0);
+                    let state = if self.admin { "지금 관리자 권한으로 실행 중입니다." } else { "지금은 관리자 권한이 없어 일반 방식으로 훑습니다." };
+                    ui.label(egui::RichText::new(state).size(12.0));
+                });
+            });
+        // "About" sits in the title bar, left of the close button (as in oddity-picview)
+        if let Some(w) = shown {
+            let at = egui::pos2(w.response.rect.right() - 92.0, w.response.rect.top() + 9.0);
+            egui::Area::new(egui::Id::unique("settings_about"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(at)
+                .show(ctx, |ui| {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("About").size(12.5)).corner_radius(4.0))
+                        .on_hover_text("프로그램 정보")
+                        .clicked()
+                    {
+                        self.show_about = true;
+                    }
+                });
+        }
+        // Esc closes the About window first, then the settings window
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        self.show_settings = open && !(esc && !self.show_about);
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let muted = Color32::from_gray(150);
+        let mut open = true;
+        egui::Window::new(egui::RichText::new("About").size(17.0))
+            .id(egui::Id::unique("about_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.vertical_centered(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                    icons::paint_glyph(ui.painter(), icons::Glyph::Drive, r, true);
+                    ui.label(egui::RichText::new("oddity-diskmap").size(20.0).strong());
+                    ui.label(egui::RichText::new(format!("버전 {}", env!("CARGO_PKG_VERSION"))).color(muted));
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                egui::Grid::new("about_grid").num_columns(2).spacing(Vec2::new(16.0, 8.0)).show(ui, |ui| {
+                    ui.label(egui::RichText::new("만든 사람").color(muted));
+                    ui.label(AUTHOR);
+                    ui.end_row();
+                    ui.label(egui::RichText::new("GitHub").color(muted));
+                    ui.hyperlink_to(REPO_URL.trim_start_matches("https://"), REPO_URL)
+                        .on_hover_text("브라우저로 엽니다");
+                    ui.end_row();
+                    ui.label(egui::RichText::new("라이선스").color(muted));
+                    ui.label("MIT");
+                    ui.end_row();
+                });
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_about = false;
+        }
     }
 
     // ---------------------------------------------------------------- status
@@ -677,6 +836,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &Saved { pref: self.pref, use_alloc: self.use_alloc });
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_scan();
         if self.scan.is_some() {
@@ -704,6 +867,8 @@ impl eframe::App for App {
             }
             egui::CentralPanel::default().show(ui, |ui| actions.extend(self.table(ui)));
         }
+        self.settings_window(&ctx);
+        self.about_window(&ctx);
         self.apply(actions, &ctx);
     }
 }
