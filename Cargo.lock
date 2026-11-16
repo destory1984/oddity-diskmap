@@ -1676,6 +1676,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2405,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "oddity-diskmap"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "eframe",
@@ -2414,6 +2416,7 @@ dependencies = [
  "rayon",
  "rfd",
  "serde",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

@@ -1,6 +1,6 @@
 [package]
 name = "oddity-diskmap"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 
@@ -8,8 +8,9 @@ license = "MIT"
 chrono = "0.4.45"
 eframe = { version = "0.37.0", features = ["persistence"] }
 egui_extras = "0.37.0"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 rayon = "1.12.0"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }

@@ -91,6 +91,23 @@ pub fn relaunch_as_admin(args: &str) -> bool {
     h as isize > 32
 }
 
+/// Open a file in its default program (video player, picture viewer).
+pub fn open_file(path: &str) -> bool {
+    let file = wide(path);
+    let verb = wide("open");
+    let h = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    h as isize > 32
+}
+
 pub fn show_in_explorer(path: &str) {
     let _ = std::process::Command::new("explorer.exe")
         .arg(format!("/select,{path}"))

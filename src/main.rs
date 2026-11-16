@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cache;
+mod history;
 mod icons;
 mod scan_mft;
 mod scan_walk;
 mod tree;
 mod treemap;
+mod video;
 mod win;
 
 use eframe::egui;
@@ -42,7 +45,7 @@ pub fn run_scan(path: &str, method: Method, p: &Progress) -> Result<(Tree, Optio
                     c.store(0, Relaxed);
                 }
                 let t = scan_walk::scan(path, win::cluster_size(root), p)?;
-                return Ok((t, Some(format!("MFT 실패, 일반 방식으로 훑음: {e}"))));
+                return Ok((t, Some(format!("MFT 실패, 일반 방식으로 스캔함: {e}"))));
             }
         }
     }

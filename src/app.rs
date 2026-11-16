@@ -9,7 +9,9 @@ use eframe::egui::{
 };
 use egui_extras::{Column, TableBuilder};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::{channel, Receiver};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,11 +39,26 @@ const REPO_URL: &str = "https://github.com/destory1984/oddity-diskmap";
 struct Saved {
     pref: Pref,
     use_alloc: bool,
+    video_preview: bool,
+    cache_max_mb: u64,
+    history_on: bool,
+    history_depth: u32,
+    history_min_mb: u64,
+    history_keep: usize,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { pref: Pref::Auto, use_alloc: false }
+        Saved {
+            pref: Pref::Auto,
+            use_alloc: false,
+            video_preview: true,
+            cache_max_mb: crate::cache::DEFAULT_MAX_MB,
+            history_on: true,
+            history_depth: 4,
+            history_min_mb: 10,
+            history_keep: 10,
+        }
     }
 }
 
@@ -53,6 +70,9 @@ enum Action {
     Explorer(u32),
     Copy(u32),
     Sort(SortKey),
+    HoverVideo(u32),
+    RevealPath(String),
+    Open(u32),
 }
 
 pub struct App {
@@ -76,7 +96,63 @@ pub struct App {
     icons: Icons,
     show_settings: bool,
     show_about: bool,
+    video_preview: bool,
+    clips: HashMap<u32, Clip>,
+    clip_order: VecDeque<u32>,
+    clip_tx: Sender<ClipMsg>,
+    clip_rx: Receiver<ClipMsg>,
+    clips_running: Arc<AtomicUsize>,
+    /// node the pointer rests on (u64::MAX: none); a worker for another node gives up
+    clip_want: Arc<AtomicU64>,
+    /// video file under the pointer this frame, and since when it has been there
+    hover_now: Option<u32>,
+    hover: Option<(u32, Instant)>,
+    cache_max_mb: u64,
+    /// bytes on disk, u64::MAX while being measured
+    cache_usage: Arc<AtomicU64>,
+    history_on: bool,
+    history_depth: u32,
+    history_min_mb: u64,
+    history_keep: usize,
+    /// bytes of all saved history, u64::MAX while being measured
+    history_usage: Arc<AtomicU64>,
+    /// snapshot written for the tree on screen (left out of the comparison list)
+    last_snapshot: Option<std::path::PathBuf>,
+    /// (generation, depth, min) -> (folders, bytes) the current settings would write
+    history_estimate: Option<((u64, u32, u64), (usize, u64))>,
+    show_changes: bool,
+    changes: Option<ChangesView>,
 }
+
+/// State of the "지난번 대비" window.
+struct ChangesView {
+    snaps: Vec<crate::history::Meta>,
+    pick: usize,
+    causes_only: bool,
+    /// (generation, pick, causes_only) the rows were computed for
+    made_for: Option<(u64, usize, bool)>,
+    rows: Vec<crate::history::Change>,
+    old_total: u64,
+    error: Option<String>,
+}
+
+/// Preview frames for one video file.
+enum Clip {
+    Pending,
+    Ready(Vec<egui::TextureHandle>),
+    Failed,
+}
+
+/// (tree generation, node, frames or None on failure)
+/// (tree generation, node, frames; Err(true) = cancelled, Err(false) = failed)
+type ClipMsg = (u64, u32, Result<Vec<egui::TextureHandle>, bool>);
+
+const CLIP_FRAMES: usize = 10;
+const CLIP_W: u32 = 320;
+const CLIP_STEP: f32 = 0.7;
+const CLIP_HOVER_DELAY: f32 = 0.3;
+const CLIP_CACHE: usize = 24;
+const CLIP_THREADS: usize = 2;
 
 const LEVEL_COLORS: [Color32; 8] = [
     Color32::from_rgb(38, 70, 140),
@@ -133,6 +209,9 @@ impl App {
             .and_then(|st| eframe::get_value(st, eframe::APP_KEY))
             .unwrap_or_default();
         let drives = win::drives();
+        let (clip_tx, clip_rx) = channel();
+        let limit = saved.cache_max_mb.clamp(crate::cache::MIN_MB, crate::cache::MAX_MB) * 1024 * 1024;
+        std::thread::spawn(move || crate::cache::trim(limit));
         let path = start
             .clone()
             .or_else(|| drives.iter().find(|d| d.root == "C:\\").map(|d| d.root.clone()))
@@ -159,6 +238,26 @@ impl App {
             // DISKMAP_SHOW=settings / about opens that window at start (for screenshots)
             show_settings: matches!(std::env::var("DISKMAP_SHOW").as_deref(), Ok("settings" | "about")),
             show_about: std::env::var("DISKMAP_SHOW").as_deref() == Ok("about"),
+            video_preview: saved.video_preview,
+            clips: HashMap::new(),
+            clip_order: VecDeque::new(),
+            clip_tx,
+            clip_rx,
+            clips_running: Arc::new(AtomicUsize::new(0)),
+            clip_want: Arc::new(AtomicU64::new(u64::MAX)),
+            hover_now: None,
+            hover: None,
+            cache_max_mb: saved.cache_max_mb.clamp(crate::cache::MIN_MB, crate::cache::MAX_MB),
+            cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
+            history_on: saved.history_on,
+            history_depth: saved.history_depth.clamp(1, 12),
+            history_min_mb: saved.history_min_mb.clamp(1, 10_240),
+            history_keep: saved.history_keep.clamp(1, 200),
+            history_usage: Arc::new(AtomicU64::new(u64::MAX)),
+            last_snapshot: None,
+            history_estimate: None,
+            show_changes: std::env::var("DISKMAP_SHOW").as_deref() == Ok("changes"),
+            changes: None,
         };
         if start.is_some() {
             app.start_scan();
@@ -191,6 +290,9 @@ impl App {
         self.scan = None;
         match res {
             Ok((mut tree, note)) => {
+                self.clips.clear();
+                self.clip_order.clear();
+                self.hover = None;
                 tree.sort(self.sort.0, self.sort.1);
                 self.message = note;
                 self.expanded = vec![false; tree.nodes.len()];
@@ -206,6 +308,11 @@ impl App {
                 self.generation += 1;
                 self.rebuild_rows();
                 self.drives = win::drives();
+                self.last_snapshot = None;
+                self.changes = None;
+                if self.history_on {
+                    self.record_history();
+                }
             }
             Err(e) => self.message = Some(e),
         }
@@ -249,6 +356,14 @@ impl App {
                 Action::MapRoot(i) => {
                     self.map_root = i;
                 }
+                Action::Open(i) => {
+                    if let Some(t) = &self.tree {
+                        let path = t.path_of(i);
+                        if !win::open_file(&path) {
+                            self.message = Some(format!("열 수 없습니다: {path}"));
+                        }
+                    }
+                }
                 Action::Explorer(i) => {
                     if let Some(t) = &self.tree {
                         win::show_in_explorer(&t.path_of(i));
@@ -257,6 +372,14 @@ impl App {
                 Action::Copy(i) => {
                     if let Some(t) = &self.tree {
                         ctx.copy_text(t.path_of(i));
+                    }
+                }
+                Action::HoverVideo(i) => self.hover_now = Some(i),
+                Action::RevealPath(rel) => {
+                    if let Some(i) = self.tree.as_ref().and_then(|t| t.find_path(&rel)) {
+                        self.reveal(i);
+                    } else {
+                        self.message = Some(format!("지금 목록에 없는 폴더입니다: {rel}"));
                     }
                 }
                 Action::Sort(k) => {
@@ -277,6 +400,377 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- history
+
+    fn history_detail(&self) -> crate::history::Detail {
+        crate::history::Detail { depth: self.history_depth, min_bytes: self.history_min_mb * 1024 * 1024 }
+    }
+
+    /// Save the folder sizes of the tree on screen.
+    fn record_history(&mut self) {
+        let Some(t) = &self.tree else { return };
+        let entries = crate::history::collect(t, self.history_detail());
+        let when = chrono::Utc::now().timestamp();
+        match crate::history::save(t, when, &entries, self.history_keep) {
+            Ok(p) => self.last_snapshot = Some(p),
+            Err(e) => self.message = Some(format!("기록 저장 실패: {e}")),
+        }
+    }
+
+    fn measure_history(&self, ctx: &egui::Context) {
+        let (usage, ctx) = (self.history_usage.clone(), ctx.clone());
+        usage.store(u64::MAX, Relaxed);
+        std::thread::spawn(move || {
+            usage.store(crate::history::usage(), Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    /// "지난번 대비": folders that grew (or shrank) the most since a saved scan.
+    fn changes_window(&mut self, ctx: &egui::Context) {
+        if !self.show_changes {
+            return;
+        }
+        // no tree yet (still scanning): keep the window wanted, draw it once there is one
+        let Some(t) = &self.tree else { return };
+        if self.changes.is_none() {
+            let snaps: Vec<_> = crate::history::list(&t.root_path)
+                .into_iter()
+                .filter(|m| Some(&m.path) != self.last_snapshot.as_ref())
+                .collect();
+            self.changes = Some(ChangesView {
+                snaps,
+                pick: 0,
+                causes_only: true,
+                made_for: None,
+                rows: Vec::new(),
+                old_total: 0,
+                error: None,
+            });
+        }
+        let detail = self.history_detail();
+        let generation = self.generation;
+        let cv = self.changes.as_mut().unwrap();
+        let want = (generation, cv.pick, cv.causes_only);
+        if cv.made_for != Some(want) && !cv.snaps.is_empty() {
+            cv.made_for = Some(want);
+            let meta = &cv.snaps[cv.pick.min(cv.snaps.len() - 1)];
+            match crate::history::load(&meta.path) {
+                Some(old) => {
+                    // current side: same depth, no size floor, so new folders show up
+                    let cur = crate::history::collect(t, crate::history::Detail { depth: detail.depth, min_bytes: 0 });
+                    // list folders that changed by 1 MB or more
+                    cv.rows = crate::history::compare(&old, &cur, 1024 * 1024, cv.causes_only);
+                    cv.old_total = meta.total_alloc;
+                    cv.error = None;
+                }
+                None => {
+                    cv.rows.clear();
+                    cv.error = Some("기록 파일을 읽지 못했습니다".into());
+                }
+            }
+        }
+
+        let muted = Color32::from_gray(150);
+        let up = Color32::from_rgb(235, 110, 90);
+        let down = Color32::from_rgb(110, 200, 130);
+        let fmt_delta = |d: i64| {
+            let s = fmt_size(d.unsigned_abs());
+            if d >= 0 { format!("+{s}") } else { format!("-{s}") }
+        };
+        let fmt_when = |w: i64| {
+            chrono::DateTime::from_timestamp(w, 0)
+                .map(|t| t.with_timezone(&chrono::Local).format("%y-%m-%d %H:%M").to_string())
+                .unwrap_or_default()
+        };
+        let mut open = true;
+        let mut actions = Vec::new();
+        let cur_method = t.method;
+        let cur_total = t.nodes[t.root as usize].alloc;
+        let root_path = t.root_path.clone();
+        egui::Window::new(egui::RichText::new("지난번 대비 변화").size(17.0))
+            .id(egui::Id::unique("changes_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([680.0, 520.0])
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&root_path).color(muted));
+                if cv.snaps.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label("비교할 지난 기록이 없습니다.");
+                    ui.label(
+                        egui::RichText::new(
+                            "스캔할 때마다 폴더 크기를 기록합니다. 같은 경로를 한 번 더 스캔하면 여기서 비교할 수 있습니다. \
+                             기록 범위와 보관 개수는 설정에서 바꿉니다.",
+                        )
+                        .color(muted),
+                    );
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("비교할 기록");
+                    let label = |m: &crate::history::Meta| {
+                        format!(
+                            "{}  ({}, {}, 기록 {})",
+                            fmt_when(m.when),
+                            fmt_size(m.total_alloc),
+                            if m.method == "Mft" { "MFT" } else { "일반" },
+                            fmt_size(m.bytes)
+                        )
+                    };
+                    egui::ComboBox::from_id_salt("changes_pick")
+                        .selected_text(label(&cv.snaps[cv.pick]))
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for (k, m) in cv.snaps.iter().enumerate() {
+                                ui.selectable_value(&mut cv.pick, k, label(m));
+                            }
+                        });
+                    ui.checkbox(&mut cv.causes_only, "원인 폴더만")
+                        .on_hover_text("하위 폴더 하나가 변화의 80% 이상을 차지하면 위 폴더는 숨깁니다");
+                });
+                let d = cur_total as i64 - cv.old_total as i64;
+                ui.horizontal(|ui| {
+                    ui.label(format!("전체 할당 {} → {}", fmt_size(cv.old_total), fmt_size(cur_total)));
+                    ui.colored_label(if d >= 0 { up } else { down }, fmt_delta(d));
+                });
+                let old_method = &cv.snaps[cv.pick].method;
+                let now_method = if cur_method == Method::Mft { "Mft" } else { "Walk" };
+                if old_method != now_method {
+                    ui.colored_label(
+                        Color32::from_rgb(230, 180, 80),
+                        "스캔 방식이 달라 숫자가 어긋날 수 있습니다 (일반 방식은 권한 없는 폴더를 빼고, 하드 링크를 여러 번 셉니다).",
+                    );
+                }
+                if let Some(e) = &cv.error {
+                    ui.colored_label(up, e);
+                }
+                ui.separator();
+                if cv.rows.is_empty() && cv.error.is_none() {
+                    ui.label("1 MB 넘게 바뀐 폴더가 없습니다.");
+                    return;
+                }
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(Sense::click())
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .column(Column::initial(100.0).at_least(70.0))
+                    .column(Column::initial(90.0).at_least(60.0))
+                    .column(Column::initial(90.0).at_least(60.0))
+                    .column(Column::remainder().at_least(120.0).clip(true))
+                    .header(22.0, |mut h| {
+                        for title in ["변화", "이전", "지금", "폴더"] {
+                            h.col(|ui| {
+                                ui.strong(title);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(22.0, cv.rows.len(), |mut row| {
+                            let c = &cv.rows[row.index()];
+                            row.col(|ui| {
+                                if c.old.is_none() {
+                                    // not in the old record: new, or under its size floor then
+                                    ui.colored_label(up, format!("{} 이하", fmt_delta(c.delta)))
+                                        .on_hover_text("지난 기록에 없던 폴더입니다. 새로 생겼거나, 그때 기록 최소 크기보다 작았습니다");
+                                } else {
+                                    ui.colored_label(if c.delta >= 0 { up } else { down }, fmt_delta(c.delta));
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(c.old.map(fmt_size).unwrap_or_else(|| "기록 없음".into()))
+                                    .on_hover_text("지난번에는 없었거나, 기록 최소 크기보다 작았습니다");
+                            });
+                            row.col(|ui| {
+                                ui.label(c.new.map(fmt_size).unwrap_or_else(|| "없음".into()));
+                            });
+                            row.col(|ui| {
+                                let name = if c.rel.is_empty() { "(전체)" } else { c.rel.as_str() };
+                                ui.add(egui::Label::new(name).truncate());
+                            });
+                            let resp = row.response();
+                            if resp.clicked() && c.new.is_some() {
+                                actions.push(Action::RevealPath(c.rel.clone()));
+                            }
+                            resp.on_hover_text("누르면 표에서 이 폴더를 찾습니다");
+                        });
+                    });
+            });
+        if !open {
+            self.show_changes = false;
+        }
+        self.apply(actions, ctx);
+    }
+
+    // ---------------------------------------------------------------- video preview
+
+    /// Start making preview frames for a video file (at most CLIP_THREADS at once).
+    fn request_clip(&mut self, idx: u32, ctx: &egui::Context) {
+        if self.clips.contains_key(&idx) {
+            if let Some(pos) = self.clip_order.iter().position(|&i| i == idx) {
+                self.clip_order.remove(pos);
+                self.clip_order.push_back(idx);
+            }
+            return;
+        }
+        if self.clips_running.load(Relaxed) >= CLIP_THREADS {
+            return; // try again next frame while the pointer stays
+        }
+        let Some(t) = &self.tree else { return };
+        let path = std::path::PathBuf::from(t.path_of(idx));
+        let (size, mtime) = (t.nodes[idx as usize].size, t.nodes[idx as usize].mtime);
+        self.clips.insert(idx, Clip::Pending);
+        self.clip_order.push_back(idx);
+        while self.clip_order.len() > CLIP_CACHE {
+            if let Some(old) = self.clip_order.pop_front() {
+                self.clips.remove(&old);
+            }
+        }
+        let (tx, ctx, running, generation, want) = (
+            self.clip_tx.clone(),
+            ctx.clone(),
+            self.clips_running.clone(),
+            self.generation,
+            self.clip_want.clone(),
+        );
+        running.fetch_add(1, Relaxed);
+        std::thread::spawn(move || {
+            let key = format!("{}#clip{CLIP_FRAMES}", path.display());
+            let frames = match crate::cache::load(&key, size, mtime) {
+                Some(strip) if strip.width() >= CLIP_W => {
+                    let n = (strip.width() / CLIP_W) as usize;
+                    Some(
+                        (0..n)
+                            .map(|k| image::imageops::crop_imm(&strip, k as u32 * CLIP_W, 0, CLIP_W, strip.height()).to_image())
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => crate::video::video_frames(&path, CLIP_FRAMES, CLIP_W, &|| want.load(Relaxed) == idx as u64).ok().inspect(|v| {
+                    let h = v.iter().map(|f| f.height()).max().unwrap_or(1);
+                    let mut strip = image::RgbaImage::new(CLIP_W * v.len() as u32, h);
+                    for (k, f) in v.iter().enumerate() {
+                        image::imageops::replace(&mut strip, f, k as i64 * CLIP_W as i64, 0);
+                    }
+                    crate::cache::store(&key, size, mtime, &strip);
+                }),
+            };
+            let frames = frames.map(|v| {
+                v.into_iter()
+                    .enumerate()
+                    .map(|(k, img)| {
+                        let ci = egui::ColorImage::from_rgba_unmultiplied(
+                            [img.width() as usize, img.height() as usize],
+                            img.as_raw(),
+                        );
+                        ctx.load_texture(format!("clip/{generation}/{idx}/{k}"), ci, egui::TextureOptions::LINEAR)
+                    })
+                    .collect()
+            });
+            running.fetch_sub(1, Relaxed);
+            let cancelled = want.load(Relaxed) != idx as u64;
+            let _ = tx.send((generation, idx, frames.ok_or(cancelled)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Floating preview next to the pointer while it rests on a video file.
+    fn video_preview_popup(&mut self, ctx: &egui::Context) {
+        while let Ok((g, idx, frames)) = self.clip_rx.try_recv() {
+            if g == self.generation && self.clips.contains_key(&idx) {
+                match frames {
+                    Ok(f) => {
+                        self.clips.insert(idx, Clip::Ready(f));
+                    }
+                    // cancelled: forget it, so resting on it again starts over
+                    Err(true) => {
+                        self.clips.remove(&idx);
+                        self.clip_order.retain(|&i| i != idx);
+                    }
+                    Err(false) => {
+                        self.clips.insert(idx, Clip::Failed);
+                    }
+                }
+            }
+        }
+        if !self.video_preview {
+            self.hover = None;
+            self.clip_want.store(u64::MAX, Relaxed);
+            return;
+        }
+        self.hover = match (self.hover_now, self.hover) {
+            (Some(i), Some((j, since))) if i == j => Some((j, since)),
+            (Some(i), _) => Some((i, Instant::now())),
+            (None, _) => None,
+        };
+        self.clip_want.store(self.hover.map(|h| h.0 as u64).unwrap_or(u64::MAX), Relaxed);
+        let Some((idx, since)) = self.hover else { return };
+        let waited = since.elapsed().as_secs_f32();
+        if waited < CLIP_HOVER_DELAY {
+            ctx.request_repaint_after(Duration::from_secs_f32(CLIP_HOVER_DELAY - waited + 0.01));
+            return;
+        }
+        self.request_clip(idx, ctx);
+        let Some(t) = &self.tree else { return };
+        let Some(pointer) = ctx.pointer_hover_pos() else { return };
+        let n = &t.nodes[idx as usize];
+        let screen = ctx.content_rect();
+        let size = Vec2::new(CLIP_W as f32 + 16.0, CLIP_W as f32 * 9.0 / 16.0 + 70.0);
+        let mut at = pointer + Vec2::new(18.0, 18.0);
+        if at.x + size.x > screen.right() {
+            at.x = pointer.x - size.x - 12.0;
+        }
+        if at.y + size.y > screen.bottom() {
+            at.y = (pointer.y - size.y - 12.0).max(screen.top());
+        }
+        let clip = self.clips.get(&idx);
+        egui::Area::new(egui::Id::unique("video_preview"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(at)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(CLIP_W as f32);
+                    match clip {
+                        Some(Clip::Ready(frames)) => {
+                            let k = ((waited - CLIP_HOVER_DELAY) / CLIP_STEP) as usize % frames.len();
+                            let tex = &frames[k];
+                            let sz = tex.size_vec2();
+                            // fit in CLIP_W x 240 (portrait phone video stays short)
+                            ui.image((tex.id(), sz * (CLIP_W as f32 / sz.x).min(240.0 / sz.y)));
+                            ui.horizontal(|ui| {
+                                for j in 0..frames.len() {
+                                    let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 4.0), Sense::hover());
+                                    let c = if j == k { Color32::from_rgb(90, 160, 240) } else { Color32::from_gray(70) };
+                                    ui.painter().rect_filled(r, 1.0, c);
+                                }
+                            });
+                            ctx.request_repaint_after(Duration::from_secs_f32(CLIP_STEP / 2.0));
+                        }
+                        Some(Clip::Failed) => {
+                            ui.label(
+                                egui::RichText::new("미리보기를 만들 수 없습니다 (코덱이 없거나 깨진 파일)")
+                                    .color(Color32::from_gray(160)),
+                            );
+                        }
+                        _ => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("미리보기 만드는 중…");
+                            });
+                            ctx.request_repaint_after(Duration::from_millis(100));
+                        }
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(&*n.name).strong()).truncate());
+                    ui.label(
+                        egui::RichText::new(format!("{}  ·  {}", fmt_size(n.size), fmt_filetime(n.mtime)))
+                            .color(Color32::from_gray(160)),
+                    );
+                });
+            });
+    }
+
     // ---------------------------------------------------------------- toolbar
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -286,7 +780,7 @@ impl App {
             let scanning = self.scan.is_some();
             for d in self.drives.clone() {
                 let r = tool_button(ui, Glyph::Drive, &d.root[..2], !scanning, false).on_hover_text(format!(
-                    "{} 훑기 ({})\n사용 가능 {} / 전체 {}",
+                    "{} 스캔 ({})\n사용 가능 {} / 전체 {}",
                     &d.root[..2],
                     d.fs,
                     fmt_size(d.free),
@@ -301,14 +795,14 @@ impl App {
             let edit = ui.add_sized(
                 [300.0, 26.0],
                 egui::TextEdit::singleline(&mut self.path)
-                    .hint_text("훑을 경로")
+                    .hint_text("스캔할 경로")
                     .align(Align2::LEFT_CENTER),
             );
             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !scanning {
                 self.start_scan();
             }
             if tool_button(ui, Glyph::Tex(&self.icons.folder), "폴더", !scanning, false)
-                .on_hover_text("훑을 폴더 고르기")
+                .on_hover_text("스캔할 폴더 고르기")
                 .clicked()
             {
                 if let Some(p) = rfd::FileDialog::new().set_directory(&self.path).pick_folder() {
@@ -317,13 +811,13 @@ impl App {
                 }
             }
             if scanning {
-                if tool_button(ui, Glyph::Stop, "중지", true, false).on_hover_text("훑기 멈추기").clicked() {
+                if tool_button(ui, Glyph::Stop, "중지", true, false).on_hover_text("스캔 멈추기").clicked() {
                     if let Some(s) = &self.scan {
                         s.progress.cancel.store(true, Relaxed);
                     }
                 }
-            } else if tool_button(ui, Glyph::Tex(&self.icons.scan), "훑기", true, false)
-                .on_hover_text("경로 칸의 폴더를 훑기 (Enter)")
+            } else if tool_button(ui, Glyph::Tex(&self.icons.scan), "스캔", true, false)
+                .on_hover_text("경로 칸의 폴더를 스캔 (Enter)")
                 .clicked()
             {
                 self.start_scan();
@@ -340,6 +834,13 @@ impl App {
                 .clicked()
             {
                 self.use_alloc = true;
+            }
+            ui.separator();
+            if tool_button(ui, Glyph::Changes, "변화", self.tree.is_some(), self.show_changes)
+                .on_hover_text("지난번 스캔 대비 많이 커진 폴더")
+                .clicked()
+            {
+                self.show_changes = !self.show_changes;
             }
             ui.separator();
             if self.admin {
@@ -360,12 +861,25 @@ impl App {
                     .clicked()
                 {
                     self.show_settings = !self.show_settings;
+                    if self.show_settings {
+                        self.measure_cache(ui.ctx());
+                        self.measure_history(ui.ctx());
+                    }
                 }
             });
         });
     }
 
     // ---------------------------------------------------------------- settings
+
+    fn measure_cache(&self, ctx: &egui::Context) {
+        let (usage, ctx) = (self.cache_usage.clone(), ctx.clone());
+        usage.store(u64::MAX, Relaxed);
+        std::thread::spawn(move || {
+            usage.store(crate::cache::usage(), Relaxed);
+            ctx.request_repaint();
+        });
+    }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         use egui::text::{LayoutJob, TextFormat};
@@ -387,6 +901,9 @@ impl App {
         let mut open = true;
         let shown = egui::Window::new(title)
             .id(egui::Id::unique("settings_window"))
+            .vscroll(true)
+            .min_height((ctx.content_rect().height() - 140.0).clamp(240.0, 760.0))
+            .max_height((ctx.content_rect().height() - 120.0).max(240.0))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -396,7 +913,7 @@ impl App {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 egui::Frame::group(ui.style()).inner_margin(12).show(ui, |ui| {
                     ui.set_width(354.0);
-                    ui.label(egui::RichText::new("훑는 방식").size(15.0).strong());
+                    ui.label(egui::RichText::new("스캔 방식").size(15.0).strong());
                     ui.separator();
                     ui.radio_value(&mut self.pref, Pref::Auto, "MFT 방식 (빠름)");
                     ui.add(egui::Label::new(egui::RichText::new(
@@ -408,8 +925,172 @@ impl App {
                         "폴더를 하나씩 엽니다. 같은 드라이브에서 24 → 27초였습니다. 권한 없는 폴더는 건너뜁니다.",
                     ).size(12.0).color(muted)).wrap());
                     ui.add_space(2.0);
-                    let state = if self.admin { "지금 관리자 권한으로 실행 중입니다." } else { "지금은 관리자 권한이 없어 일반 방식으로 훑습니다." };
+                    let state = if self.admin { "지금 관리자 권한으로 실행 중입니다." } else { "지금은 관리자 권한이 없어 일반 방식으로 스캔합니다." };
                     ui.label(egui::RichText::new(state).size(12.0));
+                });
+                egui::Frame::group(ui.style()).inner_margin(12).show(ui, |ui| {
+                    ui.set_width(354.0);
+                    ui.label(egui::RichText::new("동영상 미리보기").size(15.0).strong());
+                    ui.separator();
+                    ui.checkbox(&mut self.video_preview, "동영상에서 10장을 뽑아 돌려 보여 주기");
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "표나 트리맵에서 동영상 파일 위에 마우스를 0.3초 올리면 옆에 뜨고, 0.7초마다 다음 장으로 넘어갑니다. \
+                         Windows에 들어 있는 코덱으로 읽습니다.",
+                    ).size(12.0).color(muted)).wrap());
+                });
+                egui::Frame::group(ui.style()).inner_margin(12).show(ui, |ui| {
+                    use crate::cache::{MAX_MB, MIN_MB};
+                    ui.set_width(354.0);
+                    ui.label(egui::RichText::new("썸네일 캐시").size(15.0).strong());
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "동영상 미리보기 10장은 영상을 풀어 뽑아야 해서 한 편에 몇 초씩 걸립니다. \
+                         그래서 한 번 만든 것을 디스크에 저장해 두고 다음에 다시 씁니다. \
+                         시험한 영상 한 편이 38 KB였고 장면이 복잡하면 더 큽니다. 비워도 영상은 그대로이고 다음에 볼 때 다시 만듭니다.",
+                    ).size(12.0).color(muted)).wrap());
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("최대 크기");
+                        ui.spacing_mut().slider_width = 170.0;
+                        ui.add(egui::Slider::new(&mut self.cache_max_mb, MIN_MB..=MAX_MB).show_value(false));
+                        ui.add(egui::DragValue::new(&mut self.cache_max_mb).range(MIN_MB..=MAX_MB).speed(5).suffix(" MB"))
+                            .on_hover_text("클릭하여 직접 넣거나 좌우로 끌어 바꿉니다");
+                    });
+                    ui.horizontal(|ui| {
+                        for (label, mb) in [("100MB", 100), ("300MB", 300), ("500MB", 500), ("1GB", 1024)] {
+                            let b = egui::Button::new(label).selected(self.cache_max_mb == mb);
+                            if ui.add_sized([80.0, 26.0], b).clicked() {
+                                self.cache_max_mb = mb;
+                            }
+                        }
+                    });
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "한도를 넘으면 다음 실행 때 오래 안 쓴 것부터 지워 한도의 80%로 줄입니다.",
+                    ).size(12.0).color(muted)).wrap());
+                    let limit = self.cache_max_mb * 1024 * 1024;
+                    let used = self.cache_usage.load(Relaxed);
+                    let busy = used == u64::MAX;
+                    let ratio = if busy { 0.0 } else { (used as f32 / limit as f32).min(1.0) };
+                    let over = !busy && used > limit;
+                    let color = if over { Color32::from_rgb(220, 90, 70) } else { Color32::from_rgb(80, 150, 230) };
+                    ui.label(egui::RichText::new(if busy {
+                        "사용량 확인 중…".to_string()
+                    } else {
+                        format!(
+                            "사용 중: {} / {}  ({:.0}%){}",
+                            fmt_size(used),
+                            fmt_size(limit),
+                            used as f32 / limit as f32 * 100.0,
+                            if over { "  한도 초과" } else { "" }
+                        )
+                    }).color(if busy { muted } else { color }));
+                    ui.add(egui::ProgressBar::new(ratio).desired_width(354.0).desired_height(8.0).fill(color));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("지금 줄이기"))
+                            .on_hover_text("한도를 넘었을 때만 80%로 줄입니다")
+                            .clicked()
+                        {
+                            let (usage, c) = (self.cache_usage.clone(), ctx.clone());
+                            usage.store(u64::MAX, Relaxed);
+                            std::thread::spawn(move || {
+                                crate::cache::trim(limit);
+                                usage.store(crate::cache::usage(), Relaxed);
+                                c.request_repaint();
+                            });
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new(egui::RichText::new("모두 비우기").color(Color32::from_rgb(230, 110, 95))))
+                            .clicked()
+                        {
+                            self.message = Some(match crate::cache::clear() {
+                                Ok(()) => "썸네일 캐시를 비웠습니다".into(),
+                                Err(e) => format!("캐시 삭제 실패: {e}"),
+                            });
+                            self.measure_cache(ctx);
+                        }
+                        if ui.add(egui::Button::image_and_text((self.icons.folder.id(), Vec2::splat(16.0)), "폴더 열기")).clicked() {
+                            if let Some(d) = crate::cache::dir() {
+                                let _ = std::process::Command::new("explorer").arg(d).spawn();
+                            }
+                        }
+                    });
+                    if let Some(d) = crate::cache::dir() {
+                        ui.add(egui::Label::new(egui::RichText::new(d.display().to_string()).size(12.0).color(muted)).wrap());
+                    }
+                });
+                egui::Frame::group(ui.style()).inner_margin(12).show(ui, |ui| {
+                    ui.set_width(354.0);
+                    ui.label(egui::RichText::new("스캔 기록 (지난번 대비)").size(15.0).strong());
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "스캔이 끝날 때마다 폴더 크기를 파일로 남겨, 다음 스캔 때 많이 커진 폴더를 찾습니다. \
+                         깊이를 늘리고 최소 크기를 줄이면 더 자세해지지만 기록 파일이 커집니다.",
+                    ).size(12.0).color(muted)).wrap());
+                    ui.separator();
+                    ui.checkbox(&mut self.history_on, "스캔할 때마다 기록 남기기");
+                    ui.add_enabled_ui(self.history_on, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("폴더 깊이");
+                            ui.add(egui::Slider::new(&mut self.history_depth, 1..=12).suffix(" 단계"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("최소 크기");
+                            ui.add(egui::DragValue::new(&mut self.history_min_mb).range(1..=10_240).speed(1).suffix(" MB"));
+                            for mb in [1u64, 10, 100] {
+                                let b = egui::Button::new(format!("{mb}MB")).selected(self.history_min_mb == mb);
+                                if ui.add(b).clicked() {
+                                    self.history_min_mb = mb;
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("보관 개수");
+                            ui.add(egui::DragValue::new(&mut self.history_keep).range(1..=200).speed(1).suffix(" 개"));
+                            ui.label(egui::RichText::new("경로마다, 오래된 것부터 지움").size(12.0).color(muted));
+                        });
+                        // what one snapshot costs with these settings, on the tree on screen
+                        if let Some(t) = &self.tree {
+                            let k = (self.generation, self.history_depth, self.history_min_mb);
+                            if self.history_estimate.map(|e| e.0) != Some(k) {
+                                let entries = crate::history::collect(t, self.history_detail());
+                                let bytes = entries.iter().map(|e| e.0.len() as u64 + 24).sum::<u64>() + 120;
+                                self.history_estimate = Some((k, (entries.len(), bytes)));
+                            }
+                            let (n, b) = self.history_estimate.unwrap().1;
+                            ui.label(egui::RichText::new(format!(
+                                "지금 화면의 {} 기준: 한 번에 폴더 {}개, 약 {}. 다 차면 {}",
+                                t.root_path,
+                                fmt_count(n as u64),
+                                fmt_size(b),
+                                fmt_size(b * self.history_keep as u64)
+                            )).size(12.0));
+                        }
+                    });
+                    let used = self.history_usage.load(Relaxed);
+                    ui.horizontal(|ui| {
+                        ui.label(if used == u64::MAX {
+                            "기록 사용량 확인 중…".to_string()
+                        } else {
+                            format!("기록 전체: {}", fmt_size(used))
+                        });
+                        if ui
+                            .add_enabled(used != u64::MAX, egui::Button::new(egui::RichText::new("모두 지우기").color(Color32::from_rgb(230, 110, 95))))
+                            .clicked()
+                        {
+                            self.message = Some(match crate::history::clear() {
+                                Ok(()) => "스캔 기록을 모두 지웠습니다".into(),
+                                Err(e) => format!("기록 삭제 실패: {e}"),
+                            });
+                            self.last_snapshot = None;
+                            self.changes = None;
+                            self.measure_history(ctx);
+                        }
+                        if ui.add(egui::Button::image_and_text((self.icons.folder.id(), Vec2::splat(16.0)), "폴더 열기")).clicked() {
+                            if let Some(d) = crate::history::base_dir() {
+                                let _ = std::fs::create_dir_all(&d);
+                                let _ = std::process::Command::new("explorer").arg(d).spawn();
+                            }
+                        }
+                    });
                 });
             });
         // "About" sits in the title bar, left of the close button (as in oddity-picview)
@@ -515,7 +1196,7 @@ impl App {
         let p = &s.progress;
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
-            let m = if s.method == Method::Mft { "MFT를 읽는 중" } else { "폴더를 훑는 중" };
+            let m = if s.method == Method::Mft { "MFT를 읽는 중" } else { "폴더를 스캔하는 중" };
             ui.heading(format!("{m}… {}", self.path));
             ui.add_space(12.0);
             ui.label(format!(
@@ -544,7 +1225,7 @@ impl App {
         let mut actions = Vec::new();
         let Some(t) = &self.tree else {
             ui.centered_and_justified(|ui| {
-                ui.label("드라이브 단추를 누르거나 경로를 넣고 ▶ 훑기를 누르십시오.");
+                ui.label("드라이브 단추를 누르거나 경로를 넣고 스캔을 누르십시오.");
             });
             return actions;
         };
@@ -683,15 +1364,26 @@ impl App {
                 });
 
                 let resp = row.response();
+                if resp.hovered() && !n.is_dir && crate::video::is_video(&n.name) {
+                    actions.push(Action::HoverVideo(idx));
+                }
                 if resp.clicked() {
                     actions.push(Action::Select(idx));
                 }
-                if resp.double_clicked() && n.is_dir {
-                    actions.push(Action::Toggle(idx));
+                if resp.double_clicked() {
+                    if n.is_dir {
+                        actions.push(Action::Toggle(idx));
+                    } else if crate::video::is_media(&n.name) {
+                        actions.push(Action::Open(idx));
+                    }
                 }
                 resp.context_menu(|ui| {
                     if n.is_dir && ui.button("트리맵에서 보기").clicked() {
                         actions.push(Action::MapRoot(idx));
+                        ui.close();
+                    }
+                    if !n.is_dir && crate::video::is_media(&n.name) && ui.button("열기").clicked() {
+                        actions.push(Action::Open(idx));
                         ui.close();
                     }
                     if ui.button("탐색기에서 열기").clicked() {
@@ -815,13 +1507,25 @@ impl App {
                     if n.is_dir { format!(", 폴더 {}개", fmt_count(n.dirs)) } else { String::new() }
                 )
             };
-            resp.clone().on_hover_text_at_pointer(tip);
+            let video = h.idx != FREE
+                && self.video_preview
+                && !t.nodes[h.idx as usize].is_dir
+                && crate::video::is_video(&t.nodes[h.idx as usize].name);
+            if video {
+                actions.push(Action::HoverVideo(h.idx));
+            } else {
+                resp.clone().on_hover_text_at_pointer(tip);
+            }
             if h.idx != FREE {
                 if resp.double_clicked() {
                     let n = &t.nodes[h.idx as usize];
-                    let target = if n.is_dir { h.idx } else { n.parent };
-                    if target != NO_PARENT {
-                        actions.push(Action::MapRoot(target));
+                    if !n.is_dir && crate::video::is_media(&n.name) {
+                        actions.push(Action::Open(h.idx));
+                    } else {
+                        let target = if n.is_dir { h.idx } else { n.parent };
+                        if target != NO_PARENT {
+                            actions.push(Action::MapRoot(target));
+                        }
                     }
                 } else if resp.clicked() {
                     actions.push(Action::Reveal(h.idx));
@@ -837,7 +1541,16 @@ impl App {
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &Saved { pref: self.pref, use_alloc: self.use_alloc });
+        eframe::set_value(storage, eframe::APP_KEY, &Saved {
+            pref: self.pref,
+            use_alloc: self.use_alloc,
+            video_preview: self.video_preview,
+            cache_max_mb: self.cache_max_mb,
+            history_on: self.history_on,
+            history_depth: self.history_depth,
+            history_min_mb: self.history_min_mb,
+            history_keep: self.history_keep,
+        });
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -846,6 +1559,7 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let ctx = ui.ctx().clone();
+        self.hover_now = None;
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
@@ -867,8 +1581,10 @@ impl eframe::App for App {
             }
             egui::CentralPanel::default().show(ui, |ui| actions.extend(self.table(ui)));
         }
+        self.changes_window(&ctx);
         self.settings_window(&ctx);
         self.about_window(&ctx);
         self.apply(actions, &ctx);
+        self.video_preview_popup(&ctx);
     }
 }

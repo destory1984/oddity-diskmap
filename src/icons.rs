@@ -49,6 +49,7 @@ pub enum Glyph<'a> {
     Shield,
     Size,
     Alloc,
+    Changes,
 }
 
 pub const ICON: f32 = 20.0;
@@ -163,6 +164,21 @@ pub fn paint_glyph(p: &Painter, glyph: Glyph, r: Rect, enabled: bool) {
                     Stroke::new(1.0, dim(Color32::from_gray(150))),
                 );
             }
+        }
+        Glyph::Changes => {
+            // rising bars with an arrow: "what grew"
+            let base = r.bottom() - 2.0 * s;
+            for (k, h) in [5.0f32, 9.0, 14.0].iter().enumerate() {
+                let x = r.left() + (2.0 + k as f32 * 5.5) * s;
+                let bar = Rect::from_min_max(pos2(x, base - h * s), pos2(x + 4.0 * s, base));
+                p.rect_filled(bar, 1.0, dim(Color32::from_rgb(80, 150, 230)));
+            }
+            let a = pos2(r.left() + 3.0 * s, r.top() + 9.0 * s);
+            let b = pos2(r.right() - 3.0 * s, r.top() + 2.5 * s);
+            let red = dim(Color32::from_rgb(235, 110, 90));
+            p.line_segment([a, b], Stroke::new(2.0, red));
+            p.line_segment([b, b + vec2(-5.0, 0.5) * s], Stroke::new(2.0, red));
+            p.line_segment([b, b + vec2(-1.0, 4.5) * s], Stroke::new(2.0, red));
         }
         Glyph::Alloc => {
             // disk blocks: a 3 x 3 grid, last block half used
